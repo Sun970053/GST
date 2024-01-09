@@ -64,8 +64,8 @@ all: main-build
 main-build: sx1276_spi_F103C8T6.elf secondary-outputs
 
 # Tool invocations
-sx1276_spi_F103C8T6.elf sx1276_spi_F103C8T6.map: $(OBJS) $(USER_OBJS) C:\Users\e1406\Documents\STM32CubeIDE\workspace_1.11.2\sx1276_spi_F103C8T6\STM32F103C8TX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
-	arm-none-eabi-gcc -o "sx1276_spi_F103C8T6.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m3 -T"C:\Users\e1406\Documents\STM32CubeIDE\workspace_1.11.2\sx1276_spi_F103C8T6\STM32F103C8TX_FLASH.ld" --specs=nosys.specs -Wl,-Map="sx1276_spi_F103C8T6.map" -Wl,--gc-sections -static --specs=nano.specs -mfloat-abi=soft -mthumb -u _printf_float -u _scanf_float -Wl,--start-group -lc -lm -Wl,--end-group
+sx1276_spi_F103C8T6.elf sx1276_spi_F103C8T6.map: $(OBJS) $(USER_OBJS) C:\Users\spacelab-cute-PC\git\GST\sx1276_spi_F103C8T6\STM32F103C8TX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
+	arm-none-eabi-gcc -o "sx1276_spi_F103C8T6.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m3 -T"C:\Users\spacelab-cute-PC\git\GST\sx1276_spi_F103C8T6\STM32F103C8TX_FLASH.ld" --specs=nosys.specs -Wl,-Map="sx1276_spi_F103C8T6.map" -Wl,--gc-sections -static --specs=nano.specs -mfloat-abi=soft -mthumb -u _printf_float -u _scanf_float -Wl,--start-group -lc -lm -Wl,--end-group
 	@echo 'Finished building target: $@'
 	@echo ' '
 

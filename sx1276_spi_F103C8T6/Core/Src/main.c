@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "cmsis_os.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -42,7 +43,17 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define SET_FREQUENCY 	0
+#define GET_FREQUENCY 	1
+#define SET_BANDWIDTH	2
+#define GET_BANDWIDTH 	3
+#define SET_PCKT_STR 	4
+#define GET_PCKT_STR 	5
+#define GET_TEMP 		6
+#define GET_RH		 	7
+#define GET_LOCATION	8
+#define GET_TIME		9
+#define UNKNOWN			255
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -51,8 +62,6 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
-RTC_HandleTypeDef hrtc;
-
 SPI_HandleTypeDef hspi1;
 
 TIM_HandleTypeDef htim1;
@@ -61,7 +70,15 @@ TIM_HandleTypeDef htim4;
 UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 UART_HandleTypeDef huart3;
+
+osThreadId LEDHandle;
+osThreadId myTask02Handle;
+osThreadId myTask03Handle;
 /* USER CODE BEGIN PV */
+TaskHandle_t processCmdTaskHandler = NULL;
+TaskHandle_t rxCmdTaskHandler = NULL;
+QueueHandle_t cmdQueue;
+QueueHandle_t rxcmdQueue;
 xSemaphoreHandle DHT_Sem;
 xSemaphoreHandle LoRa_Sem;
 //--------LoRa--------
@@ -87,11 +104,18 @@ float fix_latitude, fix_longitude;
 float lat_afterPoint, lon_afterPoint;
 
 //------BlueTooth------
-uint8_t rx_data;
+typedef struct
+{
+	uint32_t temp;
+	uint16_t cmd;
+	uint32_t param;
+}rxCmd;
+uint8_t rx_data, flag;
+rxCmd myrxCmd;
 
 //------RTC------
-RTC_TimeTypeDef gTime;
-RTC_DateTypeDef gDate;
+//RTC_TimeTypeDef gTime;
+//RTC_DateTypeDef gDate;
 
 /* USER CODE END PV */
 
@@ -104,7 +128,6 @@ static void MX_TIM1_Init(void);
 static void MX_TIM4_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_USART3_UART_Init(void);
-static void MX_RTC_Init(void);
 void LEDTask(void const * argument);
 void StartTask02(void const * argument);
 void StartTask03(void const * argument);
@@ -116,27 +139,43 @@ void StartTask03(void const * argument);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 void float2Bytes(float val,uint8_t* bytes_array);
+void menuDisplay();
 void LORA_Task(void* pvParameter);
 void DHT22_Task(void* pvParameter);
 void GPSR_Task(void* pvParameter);
 void BLE_Task(void* pvParameter);
+void processCmdTask(void* pvParameter);
+void rxCmdTask(void* pvParameter);
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef* huart)
 {
-	if(huart == &huart3)
+	if(huart->Instance == USART3)
 	{
-		if(rx_data == 'R')
+		switch(rx_data)
 		{
-			HAL_UART_Transmit(&huart3, (uint8_t *)"Reset GST !\n", 12, 0xffff);
-		}
-		if(rx_data == 'A')
-		{
-			HAL_UART_Transmit(&huart3, (uint8_t *)"Packet: ", 8, 0xffff);
-			HAL_UART_Transmit(&huart3, (uint8_t *)TxBuffer, strlen(TxBuffer), 0xffff);
+		case ' ':
+			myrxCmd.cmd = myrxCmd.temp;
+			myrxCmd.temp = 0;
+			flag = 1;
+			break;
+		case '\n':
+			if(flag)
+				myrxCmd.param = myrxCmd.temp;
+			else
+				myrxCmd.cmd = myrxCmd.temp;
+			myrxCmd.temp = 0;
+			flag = 0;
+			BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+			// notify cmd handling tasks
+			xQueueSendFromISR(rxcmdQueue, &myrxCmd, &xHigherPriorityTaskWoken);
+			break;
+		default:
+			myrxCmd.temp=10*myrxCmd.temp + rx_data - 0x30;
 		}
 
+
 	}
-	HAL_UART_Receive_IT(&huart3, &rx_data, 1);
+
 }
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
@@ -149,7 +188,7 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 			HAL_GPIO_WritePin(OUTPUT_BTN_GPIO_Port, OUTPUT_BTN_Pin, GPIO_PIN_SET);
 			sprintf(message, "Button Interrupt\r\n");
 			HAL_UART_Transmit(&huart1, (uint8_t*)message, strlen(message), 0xffff);
-			memset(message, NULL, strlen(message));
+			memset(message, '\0', strlen((char*)message));
 			BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 			xSemaphoreGiveFromISR (LoRa_Sem, &xHigherPriorityTaskWoken);
 			portEND_SWITCHING_ISR(xHigherPriorityTaskWoken);
@@ -158,6 +197,84 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
   }
 
 }
+
+void rxCmdTask(void* pvParameter)
+{
+	char *info;
+	rxCmd currentCmd;
+	while(1)
+	{
+		// block until notification
+		if(xQueueReceive(rxcmdQueue, &currentCmd, portMAX_DELAY ) == pdPASS){
+			// critical section
+			taskENTER_CRITICAL();
+
+			// get command code
+			switch(currentCmd.cmd)
+			{
+			case SET_FREQUENCY:
+				info = pvPortMalloc(100*sizeof(char));
+				sprintf(info, "Set SX-1276 frequency: %d\r\n", (int)currentCmd.param);
+				HAL_UART_Transmit(&huart3, (uint8_t *)info, strlen(info), 0xffff);
+				vPortFree(info);
+				myLoRa.frequency = currentCmd.param;
+				LoRa_setFrequency(&myLoRa, myLoRa.frequency);
+				break;
+			case GET_FREQUENCY:
+				info = pvPortMalloc(100*sizeof(char));
+				sprintf(info, "Get current frequency: %d\r\n", myLoRa.frequency);
+				HAL_UART_Transmit(&huart3, (uint8_t *)info, strlen(info), 0xffff);
+				vPortFree(info);
+				break;
+			case SET_BANDWIDTH:
+				break;
+			case GET_BANDWIDTH:
+				info = pvPortMalloc(100*sizeof(char));
+				sprintf(info, "Get current bandwidth: %d\r\n", myLoRa.bandWidth);
+				HAL_UART_Transmit(&huart3, (uint8_t *)info, strlen(info), 0xffff);
+				vPortFree(info);
+				break;
+			case SET_PCKT_STR:
+				break;
+			case GET_PCKT_STR:
+				break;
+			case GET_TEMP:
+				info = pvPortMalloc(100*sizeof(char));
+				sprintf(info, "Get temperature (celsius): %f C\r\n", Temperature);
+				HAL_UART_Transmit(&huart3, (uint8_t *)info, strlen(info), 0xffff);
+				vPortFree(info);
+				break;
+			case GET_RH:
+				info = pvPortMalloc(100*sizeof(char));
+				sprintf(info, "Get humidity (%%): %f %% \r\n", Humidity);
+				HAL_UART_Transmit(&huart3, (uint8_t *)info, strlen(info), 0xffff);
+				vPortFree(info);
+				break;
+			default:
+				menuDisplay();
+			}
+
+			// re-enable interrupts
+			taskEXIT_CRITICAL();
+		}
+	}
+}
+
+void menuDisplay()
+{
+	HAL_UART_Transmit(&huart3, (uint8_t *)"==== CMD_HELPER ====\r\n", 40, 0xffff);
+	HAL_UART_Transmit(&huart3, (uint8_t *)"Set frequency (kHz)--------> 0\r\n", 40, 0xffff);
+	HAL_UART_Transmit(&huart3, (uint8_t *)"Get frequency (kHz)--------> 1\r\n", 40, 0xffff);
+	HAL_UART_Transmit(&huart3, (uint8_t *)"Set bandwidth (kHz)--------> 2\r\n", 40, 0xffff);
+	HAL_UART_Transmit(&huart3, (uint8_t *)"Get bandwidth (kHz)--------> 3\r\n", 40, 0xffff);
+	HAL_UART_Transmit(&huart3, (uint8_t *)"Set string content (str)---> 4\r\n", 40, 0xffff);
+	HAL_UART_Transmit(&huart3, (uint8_t *)"Get current content (HEX)--> 5\r\n", 40, 0xffff);
+	HAL_UART_Transmit(&huart3, (uint8_t *)"Get temperature (celsius)--> 6\r\n", 40, 0xffff);
+	HAL_UART_Transmit(&huart3, (uint8_t *)"Get humidity (%%)-----------> 7\r\n", 40, 0xffff);
+	HAL_UART_Transmit(&huart3, (uint8_t *)"Get location (lat, lon)----> 8\r\n", 40, 0xffff);
+	HAL_UART_Transmit(&huart3, (uint8_t *)"Get time (MM/DD/YYYY)------> 9\r\n", 40, 0xffff);
+}
+
 
 void float2Bytes(float val,uint8_t* bytes_array){
   // Create union of shared memory space
@@ -212,7 +329,7 @@ void LORA_Task(void* pvParameter){
 	//			strcat(pckt_str, itoa(TxBuffer[i], pckt_buffer, 16));
 	//			strcat(pckt_str, " ");
 	//		}
-			sprintf(TxBuffer, "HelloHelloHello");
+			sprintf((char*)TxBuffer, "HelloHelloHello");
 			HAL_GPIO_WritePin(GREEN_GPIO_Port, GREEN_Pin, GPIO_PIN_RESET);	//PC13 High
 			LoRa_transmit(&myLoRa, TxBuffer, 24, 2500);
 			info = pvPortMalloc(100*sizeof(char));
@@ -221,18 +338,18 @@ void LORA_Task(void* pvParameter){
 			vPortFree(info);
 			HAL_GPIO_WritePin(GREEN_GPIO_Port, GREEN_Pin, GPIO_PIN_SET);	//PC13 Low
 
-			HAL_RTC_GetTime(&hrtc, &gTime, RTC_FORMAT_BIN);
-			HAL_RTC_GetDate(&hrtc, &gDate, RTC_FORMAT_BIN);
-
-			info = pvPortMalloc(50*sizeof(char));
-			sprintf(info,"RTC time: %02d:%02d:%02d \r\n", gTime.Hours, gTime.Minutes, gTime.Seconds);
-			HAL_UART_Transmit(&huart1, (uint8_t *)info, strlen(info), 0xffff);
-			vPortFree(info);
-
-			info = pvPortMalloc(50*sizeof(char));
-			sprintf(info,"RTC date: %02d-%02d-%04d \r\n", gDate.Month, gDate.Date, 2000+gDate.Year);
-			HAL_UART_Transmit(&huart1, (uint8_t *)info, strlen(info), 0xffff);
-			vPortFree(info);
+//			HAL_RTC_GetTime(&hrtc, &gTime, RTC_FORMAT_BIN);
+//			HAL_RTC_GetDate(&hrtc, &gDate, RTC_FORMAT_BIN);
+//
+//			info = pvPortMalloc(50*sizeof(char));
+//			sprintf(info,"RTC time: %02d:%02d:%02d \r\n", gTime.Hours, gTime.Minutes, gTime.Seconds);
+//			HAL_UART_Transmit(&huart1, (uint8_t *)info, strlen(info), 0xffff);
+//			vPortFree(info);
+//
+//			info = pvPortMalloc(50*sizeof(char));
+//			sprintf(info,"RTC date: %02d-%02d-%04d \r\n", gDate.Month, gDate.Date, 2000+gDate.Year);
+//			HAL_UART_Transmit(&huart1, (uint8_t *)info, strlen(info), 0xffff);
+//			vPortFree(info);
 
 			vTaskDelay(500);
 			HAL_GPIO_WritePin(OUTPUT_BTN_GPIO_Port, OUTPUT_BTN_Pin, GPIO_PIN_RESET);
@@ -243,7 +360,7 @@ void LORA_Task(void* pvParameter){
 void DHT22_Task(void* pvParameter){
 	int index = 1;
 	while(1){
-		if(xSemaphoreTake(DHT_Sem, 2500) != pdTRUE){
+		if(xSemaphoreTake(DHT_Sem, 4500) != pdTRUE){
 			HAL_UART_Transmit(&huart1, (uint8_t*)"Unable to acquire DHT semaphore\r\n", 35, 100);
 		}
 		else{
@@ -307,9 +424,12 @@ void GPSR_Task(void* pvParameter){
 			// Check the VCC, also you can try connecting to the external 5V
 			HAL_UART_Transmit(&huart1, (uint8_t *)"VCC Issue, Check Connection\r\n", 20, 0xffff);
 		}
-		vTaskDelay(2000);
+		vTaskDelay(4000);
 	}
 }
+
+
+
 
 /* USER CODE END 0 */
 
@@ -347,7 +467,6 @@ int main(void)
   MX_TIM4_Init();
   MX_USART2_UART_Init();
   MX_USART3_UART_Init();
-  MX_RTC_Init();
   /* USER CODE BEGIN 2 */
 	// --LoRa initialization--
 	myLoRa = newLoRa();
@@ -360,8 +479,8 @@ int main(void)
 	myLoRa.DIO0_pin        = DIO0_Pin;
 	myLoRa.hSPIx           = &hspi1;
 
-	myLoRa.frequency             = 924400;          // default = 433 MHz
-	myLoRa.spredingFactor        = SF_12;           	// default = SF_7
+	myLoRa.frequency             = 923400;          // default = 433 MHz
+	myLoRa.spredingFactor        = SF_10;           	// default = SF_7
 	myLoRa.bandWidth             = BW_125KHz;       // default = BW_125KHz
 	myLoRa.crcRate               = CR_4_5;          // default = CR_4_5
 	myLoRa.power                 = POWER_20db;      // default = 20db
@@ -371,11 +490,11 @@ int main(void)
 	uint16_t LoRa_status = LoRa_init(&myLoRa);
 	sprintf(message, "LoRa initialization ..");
 	HAL_UART_Transmit(&huart1, (uint8_t *)message, strlen(message), 0xffff);
-	memset(message, NULL, strlen(message));
+	memset(message, '\0', strlen(message));
 	if(LoRa_status == LORA_OK){
 	  sprintf(message, " success !\r\n");
 	  HAL_UART_Transmit(&huart1, (uint8_t *)message, strlen(message), 0xffff);
-	  memset(message, NULL, strlen(message));
+	  memset(message, '\0', strlen(message));
 	}
 
 	LoRa_setSyncWord(&myLoRa, 0x34); // default: 0x12
@@ -401,14 +520,21 @@ int main(void)
 	DHT_Sem = xSemaphoreCreateBinary();
 	LoRa_Sem = xSemaphoreCreateBinary();
 
+	cmdQueue = xQueueCreate(5, sizeof(uint8_t));
+	rxcmdQueue = xQueueCreate(5, sizeof(rxCmd));
+
+
 	xTaskCreate(LORA_Task, "LORA", 1024, NULL, 2, NULL);
 	xTaskCreate(DHT22_Task, "DHT22", 256, NULL, 3, NULL);
 	xTaskCreate(GPSR_Task, "GPSR", 256, NULL, 2, NULL);
+	xTaskCreate(rxCmdTask, "RX", 1024, NULL, 4, &rxCmdTaskHandler);
+
 
 	HAL_TIM_Base_Start(&htim4);
 	HAL_TIM_Base_Start_IT(&htim1);
 
-	HAL_UART_Receive_IT(&huart3,&rx_data,1);
+	__HAL_UART_ENABLE_IT(&huart3,UART_IT_RXNE);
+//	HAL_UART_Receive_IT(&huart3, &rx_data, 1);
 
 	vTaskStartScheduler();
   /* USER CODE END 2 */
@@ -452,16 +578,14 @@ void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
-  RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
 
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_LSI|RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
-  RCC_OscInitStruct.LSIState = RCC_LSI_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
   RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL9;
@@ -483,70 +607,6 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
-  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_RTC;
-  PeriphClkInit.RTCClockSelection = RCC_RTCCLKSOURCE_LSI;
-  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
-  {
-    Error_Handler();
-  }
-}
-
-/**
-  * @brief RTC Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_RTC_Init(void)
-{
-
-  /* USER CODE BEGIN RTC_Init 0 */
-
-  /* USER CODE END RTC_Init 0 */
-
-  RTC_TimeTypeDef sTime = {0};
-  RTC_DateTypeDef DateToUpdate = {0};
-
-  /* USER CODE BEGIN RTC_Init 1 */
-
-  /* USER CODE END RTC_Init 1 */
-
-  /** Initialize RTC Only
-  */
-  hrtc.Instance = RTC;
-  hrtc.Init.AsynchPrediv = RTC_AUTO_1_SECOND;
-  hrtc.Init.OutPut = RTC_OUTPUTSOURCE_ALARM;
-  if (HAL_RTC_Init(&hrtc) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  /* USER CODE BEGIN Check_RTC_BKUP */
-
-  /* USER CODE END Check_RTC_BKUP */
-
-  /** Initialize RTC and set the Time and Date
-  */
-  sTime.Hours = 0x11;
-  sTime.Minutes = 0x22;
-  sTime.Seconds = 0x33;
-
-  if (HAL_RTC_SetTime(&hrtc, &sTime, RTC_FORMAT_BCD) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  DateToUpdate.WeekDay = RTC_WEEKDAY_MONDAY;
-  DateToUpdate.Month = RTC_MONTH_JULY;
-  DateToUpdate.Date = 0x18;
-  DateToUpdate.Year = 0x23;
-
-  if (HAL_RTC_SetDate(&hrtc, &DateToUpdate, RTC_FORMAT_BCD) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN RTC_Init 2 */
-
-  /* USER CODE END RTC_Init 2 */
-
 }
 
 /**
@@ -608,7 +668,7 @@ static void MX_TIM1_Init(void)
   htim1.Instance = TIM1;
   htim1.Init.Prescaler = 36000-1;
   htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim1.Init.Period = 4000-1;
+  htim1.Init.Period = 8000-1;
   htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim1.Init.RepetitionCounter = 0;
   htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
@@ -857,6 +917,52 @@ static void MX_GPIO_Init(void)
   * @retval None
   */
 /* USER CODE END Header_LEDTask */
+void LEDTask(void const * argument)
+{
+  /* USER CODE BEGIN 5 */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END 5 */
+}
+
+/* USER CODE BEGIN Header_StartTask02 */
+/**
+* @brief Function implementing the myTask02 thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartTask02 */
+void StartTask02(void const * argument)
+{
+  /* USER CODE BEGIN StartTask02 */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END StartTask02 */
+}
+
+/* USER CODE BEGIN Header_StartTask03 */
+/**
+* @brief Function implementing the myTask03 thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartTask03 */
+void StartTask03(void const * argument)
+{
+  /* USER CODE BEGIN StartTask03 */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END StartTask03 */
+}
 
 /**
   * @brief  Period elapsed callback in non blocking mode

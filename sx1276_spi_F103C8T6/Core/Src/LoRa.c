@@ -165,17 +165,17 @@ void LoRa_setFrequency(LoRa* _LoRa, int freq){
 	// write Msb:
 	data = F >> 16;
 	LoRa_write(_LoRa, RegFrMsb, data);
-	HAL_Delay(5);
+	//HAL_Delay(5);
 
 	// write Mid:
 	data = F >> 8;
 	LoRa_write(_LoRa, RegFrMid, data);
-	HAL_Delay(5);
+	//HAL_Delay(5);
 
 	// write Lsb:
 	data = F >> 0;
 	LoRa_write(_LoRa, RegFrLsb, data);
-	HAL_Delay(5);
+	//HAL_Delay(5);
 }
 
 void LoRa_setSyncWord(LoRa* _LoRa, uint8_t value){
